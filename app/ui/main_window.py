@@ -15,11 +15,12 @@ from app.backtest.optimizer import optimize
 from app.config import RiskSettings, Settings
 from app.data.fetcher import fetch_ohlcv, latest_price, recent_news
 from app.data.symbols import INDODAX_MARKET, INTERVAL_PERIODS, MARKETS, bars_per_year, is_indodax, market_of
-from app.live.indodax_broker import ENV_KEY, ENV_SECRET, IndodaxBroker, credentials_from_env
+from app.live.indodax_broker import IndodaxBroker, credentials_from_env
 from app.paper.broker import PaperBroker
 from app.paper.trader import PaperTrader
 from app.strategies import STRATEGIES, make_strategy
 from app.strategies.base import Strategy
+from app.ui.api_keys_dialog import ApiKeysDialog
 from app.ui.chart import ChartWidget, EquityWidget
 from app.ui.workers import Worker
 
@@ -83,6 +84,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
+        menu = self.menuBar().addMenu("Pengaturan")
+        act = menu.addAction("API Key Claude && Indodax...")
+        act.triggered.connect(lambda: self.open_api_keys("claude"))
+
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QHBoxLayout(central)
@@ -182,12 +187,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_question = QtWidgets.QLineEdit()
         self.ed_question.setPlaceholderText("Mis: Apakah strategi ini layak untuk pasar saat ini?")
         self.btn_ask = QtWidgets.QPushButton("Tanya AI")
+        self.btn_ai_keys = QtWidgets.QPushButton("Atur API Key Claude")
         self.lbl_ai_status = QtWidgets.QLabel(); self.lbl_ai_status.setWordWrap(True)
         self.lbl_ai_status.setStyleSheet("color: #8b949e;")
         f.addRow("Model", self.cb_ai_model)
         f.addRow("Effort", self.cb_ai_effort)
         f.addRow("Pertanyaan", self.ed_question)
         f.addRow(self.btn_ask)
+        f.addRow(self.btn_ai_keys)
         f.addRow(self.lbl_ai_status)
         left.addWidget(g)
         left.addStretch(1)
@@ -258,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_test_conn.clicked.connect(self.test_connection)
         self.btn_kill.clicked.connect(self.emergency_stop)
         self.btn_ask.clicked.connect(self.ask_ai)
+        self.btn_ai_keys.clicked.connect(lambda: self.open_api_keys("claude"))
         self.ed_question.returnPressed.connect(self.ask_ai)
 
     @staticmethod
@@ -287,8 +295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_max_order.setValue(s.live_max_order_idr)
         self._update_live_status()
         self.cb_ai_model.setCurrentText(s.ai_model); self.cb_ai_effort.setCurrentText(s.ai_effort)
-        self.lbl_ai_status.setText("Kredensial Anthropic terdeteksi." if credentials_available()
-                                   else "Belum ada kredensial. Set ANTHROPIC_API_KEY di environment lalu buka ulang aplikasi.")
+        self._update_ai_status()
 
     def _collect_settings(self) -> Settings:
         s = self.settings
@@ -572,12 +579,39 @@ class MainWindow(QtWidgets.QMainWindow):
     def _require_credentials(self) -> tuple[str, str] | None:
         creds = credentials_from_env()
         if creds is None:
-            QtWidgets.QMessageBox.warning(
+            QtWidgets.QMessageBox.information(
                 self, "API key Indodax belum ada",
-                f"Set environment variable {ENV_KEY} dan {ENV_SECRET} dengan API key Indodax (izin TRADE saja, "
-                "tanpa izin withdraw), lalu tutup dan buka ulang aplikasi.\n\nContoh di PowerShell:\n"
-                f'setx {ENV_KEY} "kunci-api-kamu"\nsetx {ENV_SECRET} "secret-kamu"')
+                "Isi API key dan secret key Indodax dulu di jendela berikut. "
+                "Gunakan izin Pembacaan dan Trading Spot saja, tanpa izin Penarikan.")
+            self.open_api_keys("indodax")
+            creds = credentials_from_env()
         return creds
+
+    def _update_ai_status(self):
+        from app import secrets_store as ss
+        if credentials_available():
+            self.lbl_ai_status.setText(f"API key Claude terpasang ({ss.mask(ss.get(ss.CLAUDE_KEY))}).")
+        else:
+            self.lbl_ai_status.setText("API key Claude belum diisi. Klik 'Atur API Key Claude'.")
+
+    def open_api_keys(self, focus: str = "claude"):
+        from app import secrets_store as ss
+        dlg = ApiKeysDialog(self, focus=focus)
+        if dlg.exec() != QtWidgets.QDialog.Accepted or not dlg.changed:
+            return
+        self._update_ai_status()
+        if dlg.changed & {ss.INDODAX_KEY, ss.INDODAX_SECRET} and self.live_broker is not None:
+            # key Indodax berganti: putuskan koneksi lama supaya key baru yang dipakai
+            if self.exec_live:
+                self._stop_auto("API key Indodax diganti")
+                self.exec_live = False
+                self.cb_exec_mode.setCurrentIndex(0)
+            self.live_broker.close()
+            self.live_broker = None
+            self._update_live_status()
+            self.refresh_paper_tables()
+        names = ", ".join(sorted(dlg.changed))
+        self.log(f"API key disimpan: {names}. Berlaku langsung tanpa membuka ulang aplikasi.")
 
     def _connect_live(self, creds, on_done, on_fail=None):
         s = self._collect_settings()
@@ -833,9 +867,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Belum ada data", "Jalankan backtest dulu supaya AI punya konteks data pasar.")
             return
         if not credentials_available():
-            QtWidgets.QMessageBox.warning(self, "Kredensial AI belum ada",
-                                          "Set environment variable ANTHROPIC_API_KEY (atau jalankan `ant auth login`) lalu buka ulang aplikasi.")
-            return
+            QtWidgets.QMessageBox.information(self, "API key Claude belum ada",
+                                              "Isi API key Claude dulu di jendela berikut.")
+            self.open_api_keys("claude")
+            if not credentials_available():
+                return
         s = self._collect_settings()
         question = self.ed_question.text().strip() or "Analisis kondisi pasar saat ini dan evaluasi strategi yang sedang diuji."
         df, strat, res = self.df, self.strategy, self.result
