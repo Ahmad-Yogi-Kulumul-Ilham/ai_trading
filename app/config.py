@@ -35,6 +35,8 @@ class Settings:
     strategy_params: dict = field(default_factory=dict)
     initial_cash: float = 10_000.0
     paper_interval_min: int = 5
+    live_max_order_idr: float = 50_000.0   # batas nilai per order saat trading uang asli di Indodax
+    live_fee_pct: float = 0.003            # perkiraan fee Indodax per transaksi (termasuk pajak)
     ai_model: str = "claude-opus-5-5"
     ai_effort: str = "medium"
     risk: RiskSettings = field(default_factory=RiskSettings)
