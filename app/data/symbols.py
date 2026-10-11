@@ -1,10 +1,18 @@
-"""Daftar simbol preset per pasar. Semua format mengikuti Yahoo Finance."""
+"""Daftar simbol preset per pasar.
+
+Simbol Yahoo Finance: BTC-USD, AAPL, EURUSD=X. Simbol Indodax memakai format ccxt: BTC/IDR.
+"""
 
 MARKETS = {
     "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD"],
     "Saham US": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY", "QQQ"],
     "Forex": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCHF=X", "USDIDR=X"],
+    "Crypto Indodax (IDR)": ["BTC/IDR", "ETH/IDR", "SOL/IDR", "XRP/IDR", "DOGE/IDR", "BNB/IDR", "ADA/IDR"],
 }
+
+INDODAX_MARKET = "Crypto Indodax (IDR)"
+# interval aplikasi -> interval Indodax (Indodax tidak punya 5m)
+INDODAX_INTERVALS = {"1m": "1m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "1d", "1wk": "1w"}
 
 # interval -> daftar period yang didukung yfinance
 INTERVAL_PERIODS = {
@@ -29,8 +37,14 @@ INTERVAL_SECONDS = {
 }
 
 
+def is_indodax(symbol: str) -> bool:
+    return "/" in symbol
+
+
 def market_of(symbol: str) -> str:
     s = symbol.upper()
+    if is_indodax(s):
+        return INDODAX_MARKET
     if s.endswith("=X"):
         return "Forex"
     if s.endswith("-USD") or s.endswith("-USDT"):
@@ -40,7 +54,7 @@ def market_of(symbol: str) -> str:
 
 def trading_seconds_per_year(market: str) -> float:
     """Berapa detik pasar buka dalam setahun (untuk anualisasi metrik)."""
-    if market == "Crypto":
+    if market.startswith("Crypto"):
         return 365 * 24 * 3600
     if market == "Forex":
         return 52 * 5 * 24 * 3600
@@ -49,7 +63,8 @@ def trading_seconds_per_year(market: str) -> float:
 
 def bars_per_year(market: str, interval: str) -> float:
     secs = INTERVAL_SECONDS.get(interval, 86400)
-    if interval in ("1d", "1wk"):
-        days = 365 if market == "Crypto" else (260 if market == "Forex" else 252)
-        return days if interval == "1d" else days / 5
+    if interval == "1wk":
+        return 52.0
+    if interval == "1d":
+        return 365.0 if market.startswith("Crypto") else (260.0 if market == "Forex" else 252.0)
     return trading_seconds_per_year(market) / secs
