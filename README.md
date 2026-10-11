@@ -36,28 +36,26 @@ python main.py
 
 atau klik dua kali `run.bat`.
 
-### Mengaktifkan asisten AI (opsional)
+### Mengisi API key (Claude dan Indodax)
 
-Set API key Anthropic sebagai environment variable sebelum membuka aplikasi:
+Buka menu **Pengaturan > API Key Claude & Indodax**, atau klik **Atur API Key Claude** di panel Asisten AI.
+Isi key, klik tombol **Tes**, lalu **Simpan**. Key langsung berlaku tanpa membuka ulang aplikasi.
 
-```powershell
-setx ANTHROPIC_API_KEY "sk-ant-..."
-```
-
-Tutup dan buka ulang terminal/aplikasi setelah `setx`. Tanpa key, semua fitur lain tetap berjalan.
+Key disimpan sebagai environment variable pengguna Windows (`ANTHROPIC_API_KEY`, `INDODAX_API_KEY`,
+`INDODAX_SECRET_KEY`), bukan di folder proyek, jadi tidak ikut ter-commit. Tanpa key Claude, semua fitur
+lain tetap berjalan.
 
 ## Trading uang asli di Indodax
 
-1. **Buat API key** di Indodax lewat menu *Pengaturan > Trade API*. Aktifkan izin **trade** saja.
-   Jangan aktifkan izin **withdraw**, supaya dana tidak bisa ditarik walaupun key bocor.
-2. **Simpan key di environment variable**, lalu tutup dan buka ulang aplikasi:
+1. **Buat API key lewat browser** di [indodax.com/trade_api](https://indodax.com/trade_api). Menu ini tidak ada di aplikasi Android.
+   Centang **Aktifkan Pembacaan** dan **Aktifkan Trading Spot**. Jangan centang **Penarikan IDR & Kripto**,
+   supaya dana tidak bisa ditarik walaupun key bocor. Aktifkan key lewat tautan di email.
+2. **Isi key di aplikasi** lewat menu *Pengaturan > API Key Claude & Indodax*, klik **Tes Key Indodax**, lalu **Simpan**.
+   Jangan bagikan key ke siapa pun.
 
-   ```powershell
-   setx INDODAX_API_KEY "kunci-api-kamu"
-   setx INDODAX_SECRET_KEY "secret-kamu"
-   ```
-
-   Key tidak pernah disimpan di file pengaturan aplikasi. Jangan bagikan key ke siapa pun.
+   Key baru Indodax adalah key **Trade API 2.0** dan hanya bekerja di `api.indodax.com/api/v2`.
+   Aplikasi memakai API ini langsung. Library ccxt hanya dipakai untuk data publik, karena ccxt masih memakai
+   endpoint lama `/tapi` yang menolak key baru dengan error `invalid_version_key`.
 3. Klik **Tes Koneksi Indodax** untuk melihat saldo Rupiah. Mode masih simulasi.
 4. Pilih pasar **Crypto Indodax (IDR)**, misalnya `BTC/IDR`, lalu backtest dengan fee sekitar 0,3%.
 5. Atur **Maks per order** (bawaan Rp 50.000). Minimal order Indodax sekitar Rp 10.000.
@@ -100,11 +98,14 @@ app/backtest/optimizer.py grid search
 app/paper/broker.py      broker simulasi (SQLite: data/paper.db)
 app/paper/trader.py      loop trading + manajemen risiko (dipakai simulasi dan uang asli)
 app/live/indodax_broker.py broker Indodax uang asli (SQLite: data/live_indodax.db)
+app/live/indodax_v2.py   klien Indodax Trade API 2.0 (saldo dan order)
+app/secrets_store.py     simpan dan tes API key (environment Windows)
 app/ai/advisor.py        integrasi Claude (Anthropic SDK)
 app/ui/                  PySide6 GUI (main_window.py, chart.py, workers.py)
 tests/                   pytest (tanpa koneksi internet, broker Indodax diuji dengan exchange palsu)
 tests/gui_smoke.py       smoke test GUI (butuh internet)
 tests/gui_live_smoke.py  smoke test mode uang asli dengan exchange palsu
+tests/gui_keys_smoke.py  smoke test dialog API key (offline)
 ```
 
 ## Menambah strategi sendiri
