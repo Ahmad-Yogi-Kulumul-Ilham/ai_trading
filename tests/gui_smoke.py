@@ -9,6 +9,7 @@ worker: itu menahan GIL dan membuat thread worker Python tampak macet.
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import sys
 import tempfile
@@ -32,6 +33,19 @@ def main() -> int:
     QtWidgets.QMessageBox.question = staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes)
     # jangan menimpa settings pengguna
     cfg.Settings.save = lambda self: None
+
+    class RejectingKeysDialog:
+        """Dialog API key palsu: langsung ditutup supaya tes tidak menunggu input."""
+
+        def __init__(self, parent=None, focus="claude"):
+            print(f"  (dialog API key dibuka: {focus})")
+            self.changed = set()
+
+        def exec(self):
+            return QtWidgets.QDialog.Rejected
+
+    mw.ApiKeysDialog = RejectingKeysDialog
+    os.environ.pop("ANTHROPIC_API_KEY", None)
 
     app = QtWidgets.QApplication(sys.argv)
     w = mw.MainWindow()

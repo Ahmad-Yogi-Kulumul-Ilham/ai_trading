@@ -29,6 +29,19 @@ def main() -> int:
     mw.IndodaxBroker = lambda key, secret, **kw: ib.IndodaxBroker(key, secret, db_path=tmp / "live.db",
                                                                   exchange=fake, fill_timeout_s=0, **kw)
     cfg.Settings.save = lambda self: None
+    dialog_opens: list[str] = []
+
+    class FakeKeysDialog:
+        """Pengganti dialog API key: dicatat lalu ditutup tanpa menyimpan apa pun."""
+
+        def __init__(self, parent=None, focus="claude"):
+            dialog_opens.append(focus)
+            self.changed = set()
+
+        def exec(self):
+            return QtWidgets.QDialog.Rejected
+
+    mw.ApiKeysDialog = FakeKeysDialog
     errors: list[str] = []
     answers = {"confirm_text": "SAYA PAHAM"}
     QtWidgets.QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2][:300]) or print("CRITICAL:", a[2][:300]))
@@ -79,6 +92,7 @@ def main() -> int:
         ("cek", check("backtest memakai data Rupiah", lambda: w.df is not None and w.df["close"].iloc[-1] > 1e8)),
         ("tanpa API key, aktifkan mode asli", lambda: (no_env(), choose_live())),
         ("cek", check("tanpa key tetap simulasi", lambda: not w.exec_live and w.cb_exec_mode.currentIndex() == 0)),
+        ("cek", check("tanpa key membuka dialog API key Indodax", lambda: dialog_opens == ["indodax"])),
         ("salah ketik konfirmasi", lambda: (set_env(), wrong_text(), choose_live())),
         ("cek", check("konfirmasi salah tetap simulasi", lambda: not w.exec_live)),
         ("tes koneksi", lambda: (right_text(), w.test_connection())),
