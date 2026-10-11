@@ -18,7 +18,7 @@ class StepResult:
     symbol: str
     price: float
     signal: int
-    action: str            # BUY | SELL | HOLD | SKIP
+    action: str            # BUY | SELL | HOLD | SKIP | ERROR
     message: str
     equity: float
     details: dict = field(default_factory=dict)
@@ -29,7 +29,18 @@ class PaperTrader:
         self.broker = broker
         self.risk = risk
 
+    def _order(self, fn, *args, **kwargs):
+        """Jalankan order. Error dari exchange dikembalikan sebagai pesan, bukan dilempar,
+        supaya loop otomatis tetap berjalan dan error tercatat di log."""
+        try:
+            return fn(*args, **kwargs), None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Order gagal: %s", exc)
+            return None, str(exc)
+
     def step(self, symbol: str, interval: str, strategy: Strategy) -> StepResult:
+        if hasattr(self.broker, "refresh_balance"):
+            self.broker.refresh_balance()  # broker sungguhan: ambil saldo terbaru
         period = PAPER_PERIODS.get(interval, "1y")
         df = fetch_ohlcv(symbol, interval, period, use_cache=True)
         signals = strategy.generate_signals(df)
@@ -52,12 +63,16 @@ class PaperTrader:
         if pos:
             change = price / pos["avg_price"] - 1
             if self.risk.stop_loss_pct > 0 and change <= -self.risk.stop_loss_pct:
-                r = self.broker.sell(symbol, None, price, note=f"stop loss {change:.2%}")
+                r, err = self._order(self.broker.sell, symbol, None, price, note=f"stop loss {change:.2%}")
+                if err:
+                    return StepResult(symbol, price, signal, "ERROR", f"Stop loss kena tetapi order jual gagal: {err}", equity, details)
                 equity = self.broker.equity(prices)
                 self.broker.record_equity(equity)
                 return StepResult(symbol, price, signal, "SELL", f"Stop loss kena ({change:.2%}), posisi ditutup. PnL {r['pnl']:,.2f}", equity, details)
             if self.risk.take_profit_pct > 0 and change >= self.risk.take_profit_pct:
-                r = self.broker.sell(symbol, None, price, note=f"take profit {change:.2%}")
+                r, err = self._order(self.broker.sell, symbol, None, price, note=f"take profit {change:.2%}")
+                if err:
+                    return StepResult(symbol, price, signal, "ERROR", f"Take profit kena tetapi order jual gagal: {err}", equity, details)
                 equity = self.broker.equity(prices)
                 self.broker.record_equity(equity)
                 return StepResult(symbol, price, signal, "SELL", f"Take profit kena ({change:.2%}), posisi ditutup. PnL {r['pnl']:,.2f}", equity, details)
@@ -75,15 +90,19 @@ class PaperTrader:
             qty = budget / (price * (1 + self.broker.fee_pct + self.broker.slippage_pct))
             if qty <= 0:
                 return StepResult(symbol, price, signal, "SKIP", "Cash tidak cukup untuk membuka posisi.", equity, details)
-            r = self.broker.buy(symbol, qty, price, note=f"sinyal {strategy.name}")
+            r, err = self._order(self.broker.buy, symbol, qty, price, note=f"sinyal {strategy.name}")
+            if err:
+                return StepResult(symbol, price, signal, "ERROR", f"Sinyal beli, tetapi order gagal: {err}", equity, details)
             equity = self.broker.equity({**prices, symbol: price})
             self.broker.record_equity(equity)
-            return StepResult(symbol, price, signal, "BUY", f"BUY {qty:.6f} @ {r['price']:,.4f} (fee {r['fee']:,.2f})", equity, details)
+            return StepResult(symbol, price, signal, "BUY", f"BUY {r['qty']:.8f} @ {r['price']:,.4f} (fee {r['fee']:,.2f})", equity, details)
         if signal == 0 and pos:
-            r = self.broker.sell(symbol, None, price, note=f"sinyal {strategy.name}")
+            r, err = self._order(self.broker.sell, symbol, None, price, note=f"sinyal {strategy.name}")
+            if err:
+                return StepResult(symbol, price, signal, "ERROR", f"Sinyal jual, tetapi order gagal: {err}", equity, details)
             equity = self.broker.equity(prices)
             self.broker.record_equity(equity)
-            return StepResult(symbol, price, signal, "SELL", f"SELL {r['qty']:.6f} @ {r['price']:,.4f}, PnL {r['pnl']:,.2f}", equity, details)
+            return StepResult(symbol, price, signal, "SELL", f"SELL {r['qty']:.8f} @ {r['price']:,.4f}, PnL {r['pnl']:,.2f}", equity, details)
 
         self.broker.record_equity(equity)
         state = "long" if pos else "flat"
