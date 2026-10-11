@@ -1,0 +1,8 @@
+PySide6>=6.6
+pyqtgraph>=0.13
+pandas>=2.0
+numpy>=1.26
+yfinance>=0.2.40
+scikit-learn>=1.4
+anthropic>=0.50
+pytest>=8.0
