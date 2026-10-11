@@ -14,7 +14,8 @@ from app.backtest.metrics import metrics_table
 from app.backtest.optimizer import optimize
 from app.config import RiskSettings, Settings
 from app.data.fetcher import fetch_ohlcv, latest_price, recent_news
-from app.data.symbols import INTERVAL_PERIODS, MARKETS, bars_per_year, market_of
+from app.data.symbols import INDODAX_MARKET, INTERVAL_PERIODS, MARKETS, bars_per_year, is_indodax, market_of
+from app.live.indodax_broker import ENV_KEY, ENV_SECRET, IndodaxBroker, credentials_from_env
 from app.paper.broker import PaperBroker
 from app.paper.trader import PaperTrader
 from app.strategies import STRATEGIES, make_strategy
@@ -26,6 +27,8 @@ log = logging.getLogger(__name__)
 
 AI_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]
 EFFORTS = ["low", "medium", "high"]
+EXEC_MODES = ["Simulasi (uang palsu)", "Indodax (UANG ASLI)"]
+LIVE_CONFIRM_TEXT = "SAYA PAHAM"
 
 
 def _table(headers: list[str]) -> QtWidgets.QTableWidget:
@@ -67,6 +70,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ai_chat_md: list[str] = []
         self._workers: list[Worker] = []
         self._param_widgets: dict[str, QtWidgets.QWidget] = {}
+        self.live_broker: IndodaxBroker | None = None
+        self.exec_live = False  # selalu mulai dari mode simulasi demi keamanan
 
         self.paper_timer = QtCore.QTimer(self)
         self.paper_timer.timeout.connect(self.run_paper_step)
@@ -141,8 +146,19 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(g)
 
         # Paper trading
-        g = QtWidgets.QGroupBox("4. Paper Trading (simulasi)")
+        g = QtWidgets.QGroupBox("4. Eksekusi Order")
         f = QtWidgets.QFormLayout(g)
+        self.cb_exec_mode = QtWidgets.QComboBox(); self.cb_exec_mode.addItems(EXEC_MODES)
+        self.sp_max_order = self._dspin(10_000, 1e10, 10_000, 0, "")
+        self.sp_max_order.setPrefix("Rp ")
+        self.btn_test_conn = QtWidgets.QPushButton("Tes Koneksi Indodax")
+        self.lbl_live_status = QtWidgets.QLabel(); self.lbl_live_status.setWordWrap(True)
+        self.btn_kill = QtWidgets.QPushButton("STOP DARURAT")
+        self.btn_kill.setStyleSheet("background-color: #b71c1c; color: white; font-weight: bold; padding: 6px;")
+        f.addRow("Mode", self.cb_exec_mode)
+        f.addRow("Maks per order (asli)", self.sp_max_order)
+        f.addRow(self.btn_test_conn)
+        f.addRow(self.lbl_live_status)
         self.sp_paper_min = QtWidgets.QSpinBox(); self.sp_paper_min.setRange(1, 1440); self.sp_paper_min.setSuffix(" menit")
         self.btn_paper_auto = QtWidgets.QPushButton("Mulai Otomatis")
         self.btn_paper_step = QtWidgets.QPushButton("Jalankan 1 Langkah Sekarang")
@@ -155,6 +171,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow(self.btn_paper_step)
         f.addRow(hb)
         f.addRow(self.btn_reset)
+        f.addRow(self.btn_kill)
         left.addWidget(g)
 
         # AI
@@ -237,6 +254,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_buy.clicked.connect(lambda: self.manual_order("BUY"))
         self.btn_sell.clicked.connect(lambda: self.manual_order("SELL"))
         self.btn_reset.clicked.connect(self.reset_paper)
+        self.cb_exec_mode.activated.connect(self._on_exec_mode_changed)
+        self.btn_test_conn.clicked.connect(self.test_connection)
+        self.btn_kill.clicked.connect(self.emergency_stop)
         self.btn_ask.clicked.connect(self.ask_ai)
         self.ed_question.returnPressed.connect(self.ask_ai)
 
@@ -264,6 +284,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_pos.setValue(r.position_pct * 100); self.sp_sl.setValue(r.stop_loss_pct * 100)
         self.sp_tp.setValue(r.take_profit_pct * 100); self.sp_daily.setValue(r.daily_loss_limit_pct * 100)
         self.sp_paper_min.setValue(s.paper_interval_min)
+        self.sp_max_order.setValue(s.live_max_order_idr)
+        self._update_live_status()
         self.cb_ai_model.setCurrentText(s.ai_model); self.cb_ai_effort.setCurrentText(s.ai_effort)
         self.lbl_ai_status.setText("Kredensial Anthropic terdeteksi." if credentials_available()
                                    else "Belum ada kredensial. Set ANTHROPIC_API_KEY di environment lalu buka ulang aplikasi.")
@@ -285,8 +307,12 @@ class MainWindow(QtWidgets.QMainWindow):
             take_profit_pct=self.sp_tp.value() / 100, daily_loss_limit_pct=self.sp_daily.value() / 100,
             fee_pct=self.sp_fee.value() / 100, slippage_pct=self.sp_slip.value() / 100,
         )
+        s.live_max_order_idr = self.sp_max_order.value()
         self.broker.fee_pct = s.risk.fee_pct
         self.broker.slippage_pct = s.risk.slippage_pct
+        if self.live_broker is not None:
+            self.live_broker.max_order_idr = s.live_max_order_idr
+            self.live_broker.fee_pct = s.live_fee_pct
         return s
 
     def closeEvent(self, event):
@@ -298,6 +324,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in self._workers:
             w.wait(2000)
         self.broker.close()
+        if self.live_broker is not None:
+            self.live_broker.close()
         super().closeEvent(event)
 
     # ----------------------------------------------------------- handlers
@@ -363,7 +391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(msg, 8000)
         log.info(msg)
 
-    def _start_worker(self, fn, on_done, *args, progress_slot=None, **kwargs) -> Worker:
+    def _start_worker(self, fn, on_done, *args, progress_slot=None, on_fail=None, **kwargs) -> Worker:
         w = Worker(fn, *args, **kwargs)
         if progress_slot is not None:
             # fn menerima kwarg progress(i, n) yang aman dipanggil dari thread worker
@@ -378,6 +406,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         w.done.connect(on_done)
         w.failed.connect(self._on_worker_failed)
+        if on_fail is not None:
+            w.failed.connect(on_fail)
         w.finished.connect(_cleanup)
         self._set_busy(True)
         w.start()
@@ -390,7 +420,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Terjadi kesalahan", msg)
 
     def _set_busy(self, busy: bool):
-        for b in (self.btn_backtest, self.btn_optimize, self.btn_paper_step, self.btn_buy, self.btn_sell, self.btn_ask, self.btn_apply_optim):
+        for b in (self.btn_backtest, self.btn_optimize, self.btn_paper_step, self.btn_buy, self.btn_sell, self.btn_ask,
+                  self.btn_apply_optim, self.btn_test_conn, self.cb_exec_mode):
             b.setEnabled(not busy)
         if busy:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
@@ -512,80 +543,279 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.setValue(rec[name])
         self.run_backtest()
 
-    # ------------------------------------------------------ paper trading
-    def toggle_paper_auto(self):
+    # ------------------------------------------------- eksekusi: simulasi / Indodax
+    @property
+    def active_broker(self) -> PaperBroker:
+        """Broker yang sedang dipakai: Indodax (uang asli) atau simulasi."""
+        if self.exec_live and self.live_broker is not None:
+            return self.live_broker
+        return self.broker
+
+    def _update_live_status(self):
+        if self.exec_live and self.live_broker is not None:
+            self.lbl_live_status.setText(f"MODE UANG ASLI AKTIF. Saldo Rp {self.live_broker.cash:,.0f} tersedia.")
+            self.lbl_live_status.setStyleSheet("color: #ff5252; font-weight: bold;")
+            self.setWindowTitle("Trading AI - MODE UANG ASLI (Indodax)")
+        else:
+            extra = " Indodax terhubung." if self.live_broker is not None else ""
+            self.lbl_live_status.setText("Mode simulasi. Uang asli tidak dipakai." + extra)
+            self.lbl_live_status.setStyleSheet("color: #8b949e;")
+            self.setWindowTitle("Trading AI - Backtest, Paper Trading & Asisten AI")
+        self.btn_reset.setEnabled(not self.exec_live)
+
+    def _stop_auto(self, reason: str):
         if self.paper_timer.isActive():
             self.paper_timer.stop()
             self.btn_paper_auto.setText("Mulai Otomatis")
-            self.log("Paper trading otomatis dihentikan.")
+            self.log(f"Trading otomatis dihentikan: {reason}.")
+
+    def _require_credentials(self) -> tuple[str, str] | None:
+        creds = credentials_from_env()
+        if creds is None:
+            QtWidgets.QMessageBox.warning(
+                self, "API key Indodax belum ada",
+                f"Set environment variable {ENV_KEY} dan {ENV_SECRET} dengan API key Indodax (izin TRADE saja, "
+                "tanpa izin withdraw), lalu tutup dan buka ulang aplikasi.\n\nContoh di PowerShell:\n"
+                f'setx {ENV_KEY} "kunci-api-kamu"\nsetx {ENV_SECRET} "secret-kamu"')
+        return creds
+
+    def _connect_live(self, creds, on_done, on_fail=None):
+        s = self._collect_settings()
+        existing = self.live_broker
+
+        def job():
+            b = existing or IndodaxBroker(*creds, fee_pct=s.live_fee_pct, max_order_idr=s.live_max_order_idr)
+            info = b.connect()
+            return b, info
+
+        self._start_worker(job, on_done, on_fail=on_fail)
+
+    def test_connection(self):
+        creds = self._require_credentials()
+        if not creds:
+            return
+        self.log("Menghubungkan ke Indodax...")
+
+        def done(payload):
+            b, info = payload
+            self.live_broker = b
+            self._update_live_status()
+            self.log(f"Koneksi Indodax berhasil. Saldo Rupiah tersedia Rp {info['idr_free']:,.0f}.")
+            QtWidgets.QMessageBox.information(
+                self, "Koneksi berhasil",
+                f"Terhubung ke Indodax.\nSaldo Rupiah tersedia: Rp {info['idr_free']:,.0f}\n\n"
+                "Mode masih simulasi. Pilih mode 'Indodax (UANG ASLI)' untuk mulai trading sungguhan.")
+
+        self._connect_live(creds, done)
+
+    def _on_exec_mode_changed(self, index: int):
+        if index == 0:
+            if self.exec_live:
+                self._stop_auto("pindah ke mode simulasi")
+            self.exec_live = False
+            self._update_live_status()
+            self.refresh_paper_tables()
+            self.log("Mode simulasi aktif.")
+            return
+
+        def revert():
+            self.cb_exec_mode.setCurrentIndex(0)
+            self.exec_live = False
+            self._update_live_status()
+
+        creds = self._require_credentials()
+        if not creds:
+            revert()
+            return
+        s = self._collect_settings()
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Aktifkan trading uang asli",
+            "Order akan dikirim ke akun Indodax kamu memakai UANG ASLI.\n"
+            f"Setiap order beli dibatasi Rp {s.live_max_order_idr:,.0f}. Untung dan rugi menjadi tanggunganmu.\n"
+            "Hasil backtest tidak menjamin hasil di pasar sungguhan.\n\n"
+            f"Ketik {LIVE_CONFIRM_TEXT} untuk melanjutkan:")
+        if not ok or text.strip().upper() != LIVE_CONFIRM_TEXT:
+            self.log("Aktivasi mode uang asli dibatalkan.")
+            revert()
+            return
+        self._stop_auto("pindah ke mode uang asli")
+        self.log("Menghubungkan ke Indodax untuk mode uang asli...")
+
+        def done(payload):
+            b, info = payload
+            self.live_broker = b
+            self.exec_live = True
+            if not is_indodax(self.cb_symbol.currentText()):
+                self.cb_market.setCurrentText(INDODAX_MARKET)
+                self._on_market_changed(INDODAX_MARKET)
+            self._update_live_status()
+            self.refresh_paper_tables()
+            self.log(f"MODE UANG ASLI AKTIF. Saldo Rupiah tersedia Rp {info['idr_free']:,.0f}. "
+                     "Jalankan backtest di pasangan IDR yang sama sebelum mengaktifkan bot otomatis.")
+
+        self._connect_live(creds, done, on_fail=lambda _msg: revert())
+
+    def _live_ready(self, symbol: str) -> bool:
+        if not self.exec_live:
+            return True
+        if self.live_broker is None:
+            QtWidgets.QMessageBox.warning(self, "Belum terhubung", "Indodax belum terhubung.")
+            return False
+        if not is_indodax(symbol):
+            QtWidgets.QMessageBox.warning(
+                self, "Pasangan tidak cocok",
+                f"Mode uang asli hanya untuk pasangan Rupiah Indodax, misalnya BTC/IDR. Pilih pasar '{INDODAX_MARKET}'.")
+            return False
+        return True
+
+    def emergency_stop(self):
+        self._stop_auto("STOP DARURAT")
+        self.log("STOP DARURAT ditekan. Bot otomatis berhenti.")
+        if any(w.isRunning() for w in self._workers):
+            QtWidgets.QMessageBox.information(
+                self, "Bot dihentikan",
+                "Bot otomatis sudah berhenti. Ada proses yang masih berjalan. Tunggu beberapa detik, "
+                "lalu tekan STOP DARURAT lagi kalau ingin menjual semua posisi.")
+            return
+        b = self.active_broker
+        positions = b.positions()
+        if not positions:
+            QtWidgets.QMessageBox.information(self, "Bot dihentikan", "Bot otomatis berhenti. Tidak ada posisi terbuka.")
+            return
+        names = ", ".join(p["symbol"] for p in positions)
+        ans = QtWidgets.QMessageBox.question(
+            self, "Tutup semua posisi?",
+            f"Bot sudah berhenti. Jual juga semua posisi milik bot sekarang ({names})?")
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+
+        def job():
+            if getattr(b, "is_live", False):
+                return b.close_all()
+            out = []
+            for p in b.positions():
+                out.append(b.sell(p["symbol"], None, latest_price(p["symbol"]), note="stop darurat"))
+            return out
+
+        def done(results):
+            for r in results:
+                if "error" in r:
+                    self.log(f"Gagal menjual {r['symbol']}: {r['error']}")
+                else:
+                    self.log(f"Stop darurat: SELL {r['symbol']} {r['qty']:.8g} @ {r['price']:,.2f}, PnL {r['pnl']:+,.2f}")
+            self._update_live_status()
+            self.refresh_paper_tables()
+
+        self._start_worker(job, done)
+
+    # ------------------------------------------------------ paper trading
+    def toggle_paper_auto(self):
+        if self.paper_timer.isActive():
+            self._stop_auto("dihentikan pengguna")
             return
         s = self._collect_settings()
         strat = self._make_strategy()
-        if not strat:
+        if not strat or not self._live_ready(s.symbol):
             return
+        if self.exec_live:
+            ans = QtWidgets.QMessageBox.question(
+                self, "Bot otomatis dengan uang asli",
+                f"Bot akan mengecek sinyal {strat.name} di {s.symbol} ({s.interval}) setiap {s.paper_interval_min} menit "
+                f"dan mengirim order SUNGGUHAN ke Indodax, maksimal Rp {s.live_max_order_idr:,.0f} per order.\n\n"
+                "Bot hanya berjalan selama aplikasi terbuka dan laptop menyala. Lanjutkan?")
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
         self.paper_timer.start(s.paper_interval_min * 60 * 1000)
         self.btn_paper_auto.setText("Stop Otomatis")
-        self.log(f"Paper trading otomatis aktif: {s.symbol} {s.interval} dengan {strat.name}, cek setiap {s.paper_interval_min} menit.")
+        mode = "UANG ASLI" if self.exec_live else "simulasi"
+        self.log(f"Trading otomatis ({mode}) aktif: {s.symbol} {s.interval} dengan {strat.name}, "
+                 f"cek setiap {s.paper_interval_min} menit.")
         self.run_paper_step()
 
     def run_paper_step(self):
         if any(w.isRunning() for w in self._workers):
-            self.log("Masih ada proses berjalan, langkah paper trading dilewati.")
+            self.log("Masih ada proses berjalan, langkah trading dilewati.")
             return
         s = self._collect_settings()
         strat = self._make_strategy()
-        if not strat:
+        if not strat or not self._live_ready(s.symbol):
             return
-        trader = PaperTrader(self.broker, s.risk)
+        trader = PaperTrader(self.active_broker, s.risk)
         self._start_worker(trader.step, self._on_paper_step_done, s.symbol, s.interval, strat)
 
     def _on_paper_step_done(self, res):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {res.symbol} @ {res.price:,.4f} | sinyal={res.signal} | {res.action}: {res.message} | equity {res.equity:,.2f}"
+        tag = "[ASLI] " if self.exec_live else ""
+        line = (f"[{ts}] {tag}{res.symbol} @ {res.price:,.4f} | sinyal={res.signal} | {res.action}: {res.message} "
+                f"| equity {res.equity:,.2f}")
         self.txt_paper_log.appendPlainText(line)
-        self.log(f"Paper: {res.action} - {res.message}")
+        self.log(f"{tag}Trading: {res.action} - {res.message}")
+        self._update_live_status()
         self.refresh_paper_tables(res.price, res.symbol)
 
     def refresh_paper_tables(self, price: float | None = None, symbol: str | None = None):
-        positions = self.broker.positions()
+        b = self.active_broker
+        live = getattr(b, "is_live", False)
+        cur = "Rp " if live else ""
+        positions = b.positions()
         prices = {p["symbol"]: (price if symbol == p["symbol"] and price else p["avg_price"]) for p in positions}
-        equity = self.broker.equity(prices)
-        init = self.broker.initial_cash
+        equity = b.equity(prices)
+        init = b.initial_cash
         pnl = equity - init
+        pct = pnl / init * 100 if init else 0.0
         color = "#26a69a" if pnl >= 0 else "#ef5350"
+        mode = "<b style='color:#ff5252'>UANG ASLI (Indodax)</b>" if live else "Simulasi"
         self.lbl_paper_summary.setText(
-            f"Cash: <b>{self.broker.cash:,.2f}</b> &nbsp;|&nbsp; Equity: <b>{equity:,.2f}</b> &nbsp;|&nbsp; "
-            f"PnL total: <b style='color:{color}'>{pnl:+,.2f} ({pnl / init * 100:+.2f}%)</b> &nbsp;|&nbsp; Modal awal: {init:,.2f}")
-        _fill(self.tbl_positions, [[p["symbol"], f"{p['qty']:.6g}", f"{p['avg_price']:,.4f}", p["opened_at"]] for p in positions])
-        _fill(self.tbl_orders, [[o["ts"], o["symbol"], o["side"], f"{o['qty']:.6g}", f"{o['price']:,.4f}", f"{o['fee']:.2f}",
-                                 "" if o["pnl"] is None else f"{o['pnl']:+,.2f}", o["note"] or ""] for o in self.broker.orders()])
+            f"{mode} &nbsp;|&nbsp; Cash: <b>{cur}{b.cash:,.2f}</b> &nbsp;|&nbsp; Equity: <b>{cur}{equity:,.2f}</b> "
+            f"&nbsp;|&nbsp; PnL total: <b style='color:{color}'>{pnl:+,.2f} ({pct:+.2f}%)</b> &nbsp;|&nbsp; "
+            f"Modal awal: {cur}{init:,.2f}")
+        _fill(self.tbl_positions, [[p["symbol"], f"{p['qty']:.8g}", f"{p['avg_price']:,.4f}", p["opened_at"]] for p in positions])
+        _fill(self.tbl_orders, [[o["ts"], o["symbol"], o["side"], f"{o['qty']:.8g}", f"{o['price']:,.4f}", f"{o['fee']:.2f}",
+                                 "" if o["pnl"] is None else f"{o['pnl']:+,.2f}", o["note"] or ""] for o in b.orders()])
 
     def manual_order(self, side: str):
         s = self._collect_settings()
         symbol = s.symbol
-        if side == "SELL" and not self.broker.position(symbol):
-            QtWidgets.QMessageBox.information(self, "Tidak ada posisi", f"Tidak ada posisi {symbol} untuk dijual.")
+        b = self.active_broker
+        if not self._live_ready(symbol):
             return
+        if side == "SELL" and not b.position(symbol):
+            QtWidgets.QMessageBox.information(self, "Tidak ada posisi", f"Bot tidak punya posisi {symbol} untuk dijual.")
+            return
+        if self.exec_live:
+            what = (f"BELI {symbol} maksimal Rp {s.live_max_order_idr:,.0f}" if side == "BUY"
+                    else f"JUAL semua posisi bot di {symbol}")
+            ans = QtWidgets.QMessageBox.question(self, "Konfirmasi order uang asli",
+                                                 f"Kirim order SUNGGUHAN ke Indodax: {what}?")
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
 
         def job():
+            if hasattr(b, "refresh_balance"):
+                b.refresh_balance()
             price = latest_price(symbol)
             if side == "BUY":
-                budget = min(self.broker.cash, self.broker.equity({symbol: price}) * s.risk.position_pct)
-                qty = budget / (price * (1 + self.broker.fee_pct + self.broker.slippage_pct))
-                return self.broker.buy(symbol, qty, price, note="manual")
-            return self.broker.sell(symbol, None, price, note="manual")
+                budget = min(b.cash, b.equity({symbol: price}) * s.risk.position_pct)
+                qty = budget / (price * (1 + b.fee_pct + b.slippage_pct))
+                return b.buy(symbol, qty, price, note="manual")
+            return b.sell(symbol, None, price, note="manual")
 
         def done(r):
-            msg = f"{r['side']} manual {r['symbol']} {r['qty']:.6g} @ {r['price']:,.4f}"
+            tag = "[ASLI] " if self.exec_live else ""
+            msg = f"{tag}{r['side']} manual {r['symbol']} {r['qty']:.8g} @ {r['price']:,.4f}"
             if "pnl" in r:
                 msg += f", PnL {r['pnl']:+,.2f}"
             self.txt_paper_log.appendPlainText(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}")
             self.log(msg)
+            self._update_live_status()
             self.refresh_paper_tables(r["price"], r["symbol"])
 
         self._start_worker(job, done)
 
     def reset_paper(self):
+        if self.exec_live:
+            QtWidgets.QMessageBox.information(self, "Tidak bisa", "Akun Indodax tidak bisa direset. Pindah ke mode simulasi dulu.")
+            return
         s = self._collect_settings()
         ans = QtWidgets.QMessageBox.question(self, "Reset akun paper",
                                              f"Hapus semua posisi dan riwayat order, lalu set modal ke {s.initial_cash:,.2f}?")
