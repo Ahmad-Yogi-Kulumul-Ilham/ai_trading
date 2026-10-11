@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-data/cache/
-data/paper.db
-data/settings.json
+# data lokal: cache harga, pengaturan, dan riwayat trading (simulasi dan uang asli)
+data/
 .env
