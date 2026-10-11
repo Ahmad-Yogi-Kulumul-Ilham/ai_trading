@@ -40,8 +40,9 @@ class IndodaxBroker(PaperBroker):
                  max_order_idr: float = 50_000, exchange=None, fill_timeout_s: float = 15.0):
         super().__init__(db_path=db_path, initial_cash=0.0, fee_pct=fee_pct, slippage_pct=0.0)
         if exchange is None:
-            import ccxt
-            exchange = ccxt.indodax({"apiKey": api_key, "secret": secret, "enableRateLimit": True, "timeout": 20000})
+            # Key baru dari indodax.com/trade_api adalah key Trade API 2.0, tidak bisa dipakai lewat ccxt (/tapi)
+            from app.live.indodax_v2 import IndodaxV2Client
+            exchange = IndodaxV2Client(api_key, secret)
         self.ex = exchange
         self.max_order_idr = float(max_order_idr)
         self.fill_timeout_s = fill_timeout_s
