@@ -1,19 +1,22 @@
 # Trading AI (Desktop)
 
 Aplikasi desktop Python untuk riset strategi trading di **crypto, saham US, dan forex**:
-backtest, optimasi parameter, paper trading (simulasi), dan asisten analisis berbasis Claude.
+backtest, optimasi parameter, paper trading (simulasi), trading uang asli di **Indodax**,
+dan asisten analisis berbasis Claude.
 
-> Aplikasi ini **tidak** mengirim order ke exchange/broker sungguhan. Semua eksekusi adalah simulasi (paper trading).
-> AI berperan sebagai analis, bukan eksekutor. Hasil backtest tidak menjamin hasil masa depan.
+> Secara bawaan aplikasi berjalan di **mode simulasi**. Order sungguhan hanya dikirim setelah kamu memilih
+> mode "Indodax (UANG ASLI)" dan mengetik konfirmasi. AI berperan sebagai analis, bukan eksekutor.
+> Hasil backtest tidak menjamin hasil masa depan.
 
 ## Fitur
 
-- **Data pasar** dari Yahoo Finance (gratis, tanpa API key) untuk crypto (`BTC-USD`), saham US (`AAPL`), dan forex (`EURUSD=X`). Interval 1m sampai 1 minggu, dengan cache lokal.
+- **Data pasar** dari Yahoo Finance (gratis, tanpa API key) untuk crypto (`BTC-USD`), saham US (`AAPL`), dan forex (`EURUSD=X`), serta data Rupiah langsung dari Indodax (`BTC/IDR`). Interval 1m sampai 1 minggu, dengan cache lokal.
 - **Chart candlestick** interaktif (pyqtgraph) dengan overlay indikator, panel RSI/MACD/probabilitas, dan penanda entry/exit.
 - **Strategi bawaan**: SMA Crossover, EMA Crossover, RSI Mean Reversion, MACD Trend, Bollinger Breakout, ML Prediksi Arah (Gradient Boosting, evaluasi out-of-sample), Buy & Hold.
 - **Backtester** realistis: eksekusi di open bar berikutnya, fee, slippage, stop loss / take profit intrabar. Metrik: return, CAGR, Sharpe, Sortino, max drawdown, win rate, profit factor, dll.
 - **Optimasi parameter** grid search (dibatasi 150 kombinasi, minimal 5 trade agar tidak overfit pada 1-2 trade).
 - **Paper trading** otomatis: cek sinyal tiap N menit, order simulasi disimpan di SQLite, dengan stop loss, take profit, dan batas rugi harian. Juga ada beli/jual manual.
+- **Trading uang asli di Indodax**: order market lewat API, batas nilai per order, konfirmasi berlapis, dan tombol STOP DARURAT.
 - **Asisten AI (Claude)**: analisis kondisi pasar, evaluasi strategi, dan saran perbaikan berdasarkan data, indikator, hasil backtest, dan berita terbaru.
 
 ## Instalasi
@@ -43,6 +46,37 @@ setx ANTHROPIC_API_KEY "sk-ant-..."
 
 Tutup dan buka ulang terminal/aplikasi setelah `setx`. Tanpa key, semua fitur lain tetap berjalan.
 
+## Trading uang asli di Indodax
+
+1. **Buat API key** di Indodax lewat menu *Pengaturan > Trade API*. Aktifkan izin **trade** saja.
+   Jangan aktifkan izin **withdraw**, supaya dana tidak bisa ditarik walaupun key bocor.
+2. **Simpan key di environment variable**, lalu tutup dan buka ulang aplikasi:
+
+   ```powershell
+   setx INDODAX_API_KEY "kunci-api-kamu"
+   setx INDODAX_SECRET_KEY "secret-kamu"
+   ```
+
+   Key tidak pernah disimpan di file pengaturan aplikasi. Jangan bagikan key ke siapa pun.
+3. Klik **Tes Koneksi Indodax** untuk melihat saldo Rupiah. Mode masih simulasi.
+4. Pilih pasar **Crypto Indodax (IDR)**, misalnya `BTC/IDR`, lalu backtest dengan fee sekitar 0,3%.
+5. Atur **Maks per order** (bawaan Rp 50.000). Minimal order Indodax sekitar Rp 10.000.
+6. Pilih mode **Indodax (UANG ASLI)** dan ketik `SAYA PAHAM`. Judul jendela berubah menjadi *MODE UANG ASLI*.
+7. Pakai **Beli/Jual Manual** atau **Mulai Otomatis**. Setiap order manual meminta konfirmasi.
+8. **STOP DARURAT** menghentikan bot dan menawarkan untuk menjual semua posisi milik bot.
+
+Aturan keamanan yang dipakai:
+
+- Bot hanya menjual koin yang ia beli sendiri. Koin yang sudah kamu punya sebelumnya tidak ikut terjual.
+- Setiap order beli dibatasi nilai maksimum per order dan saldo Rupiah yang tersedia.
+- Harga dan jumlah terisi dihitung dari perubahan saldo, jadi fee Indodax sudah ikut terhitung.
+- Order yang ditolak exchange dicatat sebagai `ERROR` di log. Bot tetap berjalan di langkah berikutnya.
+- Bot hanya berjalan selama aplikasi terbuka dan laptop menyala. Stop loss dicek setiap kali bot mengecek sinyal.
+- Riwayat order uang asli disimpan terpisah di `data/live_indodax.db`.
+
+Pada uji Oktober 2026 di data BTC/IDR, semua strategi di interval 1 jam rugi besar karena fee.
+Interval harian jauh lebih masuk akal untuk modal kecil.
+
 ## Alur kerja yang disarankan
 
 1. Pilih pasar, simbol, interval, rentang data. Klik **Ambil Data & Backtest**.
@@ -64,10 +98,13 @@ app/backtest/engine.py   backtester event-based
 app/backtest/metrics.py  metrik performa
 app/backtest/optimizer.py grid search
 app/paper/broker.py      broker simulasi (SQLite: data/paper.db)
-app/paper/trader.py      loop paper trading + manajemen risiko
+app/paper/trader.py      loop trading + manajemen risiko (dipakai simulasi dan uang asli)
+app/live/indodax_broker.py broker Indodax uang asli (SQLite: data/live_indodax.db)
 app/ai/advisor.py        integrasi Claude (Anthropic SDK)
 app/ui/                  PySide6 GUI (main_window.py, chart.py, workers.py)
-tests/                   pytest (tanpa koneksi internet)
+tests/                   pytest (tanpa koneksi internet, broker Indodax diuji dengan exchange palsu)
+tests/gui_smoke.py       smoke test GUI (butuh internet)
+tests/gui_live_smoke.py  smoke test mode uang asli dengan exchange palsu
 ```
 
 ## Menambah strategi sendiri
@@ -96,4 +133,4 @@ seperti WSL / Docker.
 - Data Yahoo Finance bisa tertunda ~15 menit untuk saham dan punya batas riwayat untuk interval kecil (1m hanya 7 hari).
 - Backtester long-only. Short selling belum didukung.
 - Paper trading memakai harga terakhir dari Yahoo, bukan order book sungguhan; slippage disimulasikan dengan persentase tetap.
-- Untuk koneksi ke exchange sungguhan di masa depan (misal Binance via `ccxt` atau Alpaca untuk saham US), tambahkan implementasi broker baru dengan antarmuka yang sama seperti `PaperBroker`.
+- Trading uang asli baru tersedia untuk Indodax dan hanya posisi beli (long). Exchange lain bisa ditambahkan dengan broker baru berantarmuka sama seperti `PaperBroker`.
